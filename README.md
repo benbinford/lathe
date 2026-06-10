@@ -191,6 +191,25 @@ As your library grows, the web list page (`lathe serve`) has a search box and fi
 
 Default port is `4242`; override with `--port`.
 
+## Static export
+
+If you'd rather host your tutorials on a plain web server (nginx, GitHub Pages,
+S3, `python -m http.server`) than run `lathe serve`, export them as a
+self-contained static site:
+
+```bash
+lathe export             # writes ./lathe-site
+lathe export ~/www/tuts  # or anywhere else
+```
+
+The export keeps the full reading experience — the list page with client-side
+search/filter/sort, dark mode, mermaid diagrams, LaTeX math, all fonts and
+scripts bundled locally — and drops the features that need the local server:
+delete, the verify/extend/ask buttons, and saved reading progress. Links are
+relative, so the site works from any subpath. Re-running overwrites in place;
+it won't remove pages for tutorials you've deleted since, so export into a
+dedicated directory.
+
 ## Storage layout
 
 Tutorials live globally in `~/.lathe/tutorials/`, one directory per slug:

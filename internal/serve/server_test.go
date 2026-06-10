@@ -1747,7 +1747,12 @@ func TestPartPageLoadsKatex(t *testing.T) {
 		t.Error("part page corrupted the TeX before it reached the browser")
 	}
 	// The KaTeX loader mirrors the mermaid one: inline script, local bundle.
-	if !strings.Contains(body, "/_static/katex.min.js") {
+	// The bundle path is built from body's data-assets prefix (mode-dependent
+	// since the static exporter landed), so assert both halves.
+	if !strings.Contains(body, `data-assets="/_static/"`) {
+		t.Error("part page missing the /_static/ asset prefix on <body>")
+	}
+	if !strings.Contains(body, "'katex.min.js'") {
 		t.Error("part page missing the KaTeX bundle loader")
 	}
 	if !strings.Contains(body, "renderMathInElement") {

@@ -3,8 +3,10 @@ package serve
 import (
 	"bytes"
 	"embed"
+	"errors"
 	"fmt"
 	"html/template"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -114,6 +116,21 @@ func init() {
 	}
 }
 
+// staticAssetBytes resolves a whitelisted /_static/<name> asset to its embedded
+// bytes. Fonts are exposed at flat names (single-segment route, whitelisted
+// above) but live under static/fonts/ on disk. Shared by the HTTP handler and
+// the static exporter so the whitelist stays the single boundary.
+func staticAssetBytes(name string) ([]byte, error) {
+	if _, ok := staticAssets[name]; !ok {
+		return nil, fs.ErrNotExist
+	}
+	embedPath := "static/" + name
+	if strings.HasSuffix(name, ".woff2") {
+		embedPath = "static/fonts/" + name
+	}
+	return staticFS.ReadFile(embedPath)
+}
+
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	contentType, ok := staticAssets[name]
@@ -121,13 +138,7 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	// Fonts are served at flat /_static/<name>.woff2 (single-segment route,
-	// whitelisted above) but live under static/fonts/ on disk.
-	embedPath := "static/" + name
-	if strings.HasSuffix(name, ".woff2") {
-		embedPath = "static/fonts/" + name
-	}
-	data, err := staticFS.ReadFile(embedPath)
+	data, err := staticAssetBytes(name)
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -137,40 +148,89 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
-	entries, err := os.ReadDir(s.tutorialsDir)
+// pageContext carries the per-mode rendering knobs that differ between the
+// local server (absolute URLs, server-backed UI) and the static exporter
+// (relative URLs, server-backed UI suppressed). Templates receive them as the
+// Static / AssetPrefix / ListHref data keys plus per-part hrefs.
+type pageContext struct {
+	static      bool
+	assetPrefix string              // prefix for the /_static assets, e.g. "/_static/" or "../_static/"
+	listHref    string              // href back to the list page, from a part page
+	partHref    func(string) string // href of a part file, from a sibling part page
+	css         template.CSS        // design CSS with its font URLs resolved for this page
+}
+
+// servePageContext is the local-server mode: absolute paths rooted at /.
+func (s *Server) servePageContext(slug string) pageContext {
+	return pageContext{
+		assetPrefix: "/_static/",
+		listHref:    "/",
+		partHref:    func(part string) string { return "/" + slug + "/" + part },
+		css:         s.designCSS,
+	}
+}
+
+// loadTutorials reads every tutorial under dir, newest first. Unreadable
+// entries are skipped, matching the long-standing list-page behavior. The
+// flat, newest-first ordering is the JS-off initial order; the client sort
+// control re-orders from here.
+func loadTutorials(dir string) ([]*store.Tutorial, error) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		http.Error(w, "could not read tutorials", http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 	var tutorials []*store.Tutorial
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
-		tut, err := store.ReadMetadata(filepath.Join(s.tutorialsDir, e.Name()))
+		tut, err := store.ReadMetadata(filepath.Join(dir, e.Name()))
 		if err != nil {
 			continue
 		}
 		tutorials = append(tutorials, tut)
 	}
-	// Flat, newest-first ordering — matches the previous within-group default so
-	// the JS-off initial order is unchanged. The client sort control re-orders
-	// from here.
 	sort.SliceStable(tutorials, func(a, b int) bool {
 		return tutorials[a].Created.After(tutorials[b].Created)
 	})
+	return tutorials, nil
+}
+
+// renderListPage renders the list page for either mode. hrefs maps each
+// tutorial slug to its card link (mode-dependent: "/slug/" served, relative
+// "slug/part-01.html" exported).
+func (s *Server) renderListPage(tutorials []*store.Tutorial, hrefs map[string]string, pc pageContext) ([]byte, error) {
 	var buf bytes.Buffer
 	if err := s.listTmpl.Execute(&buf, map[string]any{
 		"Tutorials":    tutorials,
-		"CSS":          s.designCSS,
+		"Hrefs":        hrefs,
+		"Static":       pc.static,
+		"AssetPrefix":  pc.assetPrefix,
+		"CSS":          pc.css,
 		"HighlightCSS": s.highlightCSS,
 	}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
+	tutorials, err := loadTutorials(s.tutorialsDir)
+	if err != nil {
+		http.Error(w, "could not read tutorials", http.StatusInternalServerError)
+		return
+	}
+	hrefs := make(map[string]string, len(tutorials))
+	for _, tut := range tutorials {
+		hrefs[tut.Slug] = "/" + tut.Slug + "/"
+	}
+	html, err := s.renderListPage(tutorials, hrefs, s.servePageContext(""))
+	if err != nil {
 		http.Error(w, "template error", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = buf.WriteTo(w)
+	_, _ = w.Write(html)
 }
 
 func (s *Server) safeTutorialPath(parts ...string) (string, bool) {
@@ -298,27 +358,44 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 // SeriesEntry is a row in the "In this series" list rendered at the bottom of
 // each series part. Title is precomputed from the part filename so the template
-// doesn't need to call into the store package.
+// doesn't need to call into the store package; Href is the mode-dependent link
+// to the part (absolute when served, relative sibling when exported).
 type SeriesEntry struct {
 	Slug    string
+	Href    string
 	Title   string
 	Number  int
 	Current bool
 }
 
 func (s *Server) renderPart(w http.ResponseWriter, tut *store.Tutorial, tutDir, part string) {
-	src, err := os.ReadFile(filepath.Join(tutDir, part))
+	html, err := s.renderPartPage(tut, tutDir, part, s.servePageContext(tut.Slug))
 	if err != nil {
-		http.Error(w, "part not found", http.StatusNotFound)
-		return
-	}
-	content, toc, err := RenderMarkdownWithTOC(src)
-	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			http.Error(w, "part not found", http.StatusNotFound)
+			return
+		}
 		http.Error(w, "render error", http.StatusInternalServerError)
 		return
 	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(html)
+}
 
-	var prevPart, nextPart, prevTitle, nextTitle string
+// renderPartPage renders one tutorial part to a full HTML page for either mode.
+// A missing part file surfaces as fs.ErrNotExist so the HTTP caller can map it
+// to a 404.
+func (s *Server) renderPartPage(tut *store.Tutorial, tutDir, part string, pc pageContext) ([]byte, error) {
+	src, err := os.ReadFile(filepath.Join(tutDir, part))
+	if err != nil {
+		return nil, err
+	}
+	content, toc, err := RenderMarkdownWithTOC(src)
+	if err != nil {
+		return nil, err
+	}
+
+	var prevPart, nextPart, prevTitle, nextTitle, prevHref, nextHref string
 	var prevNumber, nextNumber, currentNumber int
 	var seriesTOC []SeriesEntry
 	isLast := true
@@ -327,6 +404,7 @@ func (s *Server) renderPart(w http.ResponseWriter, tut *store.Tutorial, tutDir, 
 		for i, p := range tut.Parts {
 			seriesTOC = append(seriesTOC, SeriesEntry{
 				Slug:    p,
+				Href:    pc.partHref(p),
 				Title:   store.SlugToTitle(strings.TrimSuffix(p, ".md")),
 				Number:  i + 1,
 				Current: p == part,
@@ -337,11 +415,13 @@ func (s *Server) renderPart(w http.ResponseWriter, tut *store.Tutorial, tutDir, 
 				if i > 0 {
 					prevPart = tut.Parts[i-1]
 					prevTitle = store.SlugToTitle(strings.TrimSuffix(prevPart, ".md"))
+					prevHref = pc.partHref(prevPart)
 					prevNumber = i
 				}
 				if i < len(tut.Parts)-1 {
 					nextPart = tut.Parts[i+1]
 					nextTitle = store.SlugToTitle(strings.TrimSuffix(nextPart, ".md"))
+					nextHref = pc.partHref(nextPart)
 					nextNumber = i + 2
 				}
 			}
@@ -405,12 +485,17 @@ func (s *Server) renderPart(w http.ResponseWriter, tut *store.Tutorial, tutDir, 
 		"CurrentProgress":   currentProgress,
 		"CurrentPartNumber": currentNumber,
 		"Content":           template.HTML(content),
-		"CSS":               s.designCSS,
+		"CSS":               pc.css,
 		"HighlightCSS":      s.highlightCSS,
+		"Static":            pc.static,
+		"AssetPrefix":       pc.assetPrefix,
+		"ListHref":          pc.listHref,
 		"PrevPart":          prevPart,
 		"NextPart":          nextPart,
 		"PrevTitle":         prevTitle,
 		"NextTitle":         nextTitle,
+		"PrevHref":          prevHref,
+		"NextHref":          nextHref,
 		"PrevNumber":        prevNumber,
 		"NextNumber":        nextNumber,
 		"TOC":               toc,
@@ -419,11 +504,9 @@ func (s *Server) renderPart(w http.ResponseWriter, tut *store.Tutorial, tutDir, 
 		"NextPartNumber":    len(tut.Parts) + 1,
 		"PendingPartNumber": pendingPartNumber(tut.PendingPart, len(tut.Parts)+1),
 	}); err != nil {
-		http.Error(w, "template error", http.StatusInternalServerError)
-		return
+		return nil, err
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = buf.WriteTo(w)
+	return buf.Bytes(), nil
 }
 
 func pendingPartNumber(pendingPart string, fallback int) int {
